@@ -1,0 +1,415 @@
+<!-- sections/state-map.liquid -->
+<div class="state-map-section">
+  {% if section.settings.intro_text != blank %}
+    <p class="state-map-intro">{{ section.settings.intro_text }}</p>
+  {% endif %}
+
+  <div class="state-map-container" style="position:relative;">
+    <div id="state-map-svg-wrapper" role="region" aria-label="India map"></div>
+    <div id="state-tooltip" class="state-tooltip" style="display:none;position:absolute;pointer-events:none;"></div>
+  </div>
+</div>
+
+<style>
+  .state-map-section { padding: 24px 0; }
+  .state-map-intro { text-align:center; margin-bottom:12px; color:#333; }
+  #state-map-svg-wrapper svg { width:100%; height:auto; display:block; margin:0 auto; max-width:1200px; }
+
+  /* do not override SVG fills; only add stroke/transform */
+  .state-path { stroke:#cfcfcf; stroke-width:1; cursor:default; transition: transform .12s, opacity .3s, filter .18s, fill .12s; }
+  .state-path:hover, .state-path:focus, .state-path.active { transform: scale(1.02); }
+
+  .state-tooltip { background:#fff; border:1px solid #ddd; padding:6px 10px; border-radius:6px; box-shadow:0 6px 18px rgba(0,0,0,0.08); font-size:13px; z-index:9999; white-space:nowrap; }
+
+  /* clickable state styling */
+  .state-path.has-collection { cursor: pointer; }
+  .state-path.has-collection:hover,
+  .state-path.has-collection:focus { filter: drop-shadow(0 8px 20px rgba(0,0,0,0.12)); }
+
+  /* entrance visible */
+  .state-path { opacity: 0; transform-origin: center; }
+  .state-path.visible { opacity: 1; transition: opacity .45s ease, transform .22s ease; }
+
+  /* ripple circle styles (injected into svg) */
+  .state-ripple { fill: none; stroke: rgba(0,0,0,0.08); stroke-width: 1.5; opacity: 0.9; transform-origin: center; animation: rippleAnim 600ms ease-out; }
+  @keyframes rippleAnim { from { r: 2; opacity: 0.9; stroke-width: 2.5; } to { r: 90; opacity: 0; stroke-width: 1; } }
+
+  /* pulse spot (HTML element positioned over region) */
+  .state-pulse-spot.has-collection::after {
+    content: "";
+    position: absolute;
+    left: 0; top: 0;
+    width: 12px; height: 12px;
+    transform: translate(-50%, -50%) scale(0.9);
+    border-radius: 50%;
+    box-shadow: 0 0 0 6px rgba(255, 210, 150, 0.12);
+    opacity: 0.35;
+    animation: statePulse 1.8s infinite ease-in-out 0.2s;
+    pointer-events: none;
+    z-index: 5;
+  }
+  @keyframes statePulse { 0% { opacity:0.35 } 60% { opacity:0.06 } 100% { opacity:0 } }
+
+  /* state short label (HTML element positioned near centroid) */
+  .state-name-label {
+    position: absolute;
+    transform: translate(-50%, -50%);
+    font-size: 13px;
+    font-weight: 700;
+    padding: 10px 12px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.98);
+    box-shadow: 0 8px 22px rgba(0,0,0,0.12);
+    pointer-events: auto;
+    z-index: 6;
+    white-space: nowrap;
+    color: #2f7f4f;
+    border: 1px solid rgba(0,0,0,0.06);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .state-name-label.small { padding:6px 8px; font-size:12px; }
+
+  .state-name-label:focus, .state-name-label:hover { transform: translate(-50%, -60%) scale(1.02); box-shadow: 0 10px 30px rgba(0,0,0,0.14); outline:none; }
+
+  @media (max-width: 720px) {
+    .state-name-label { font-size: 11px; padding: 6px 8px; opacity: 0.95; }
+    .state-name-label.small { font-size: 10px; padding:4px 6px; }
+  }
+
+  .state-path:focus { outline: none; stroke: #ffb74d; stroke-width: 2; filter: drop-shadow(0 10px 24px rgba(0,0,0,0.16)); }
+
+  @media print { .state-tooltip, .state-name-label { display:none !important; } }
+</style>
+
+<script>
+(function(){
+  var svgUrl = {{ section.settings.svg_url | json }};
+  var baseCollectionsPath = {{ routes.collections_url | json }};
+  var hoverFill = {{ section.settings.hover_color | default: '#ffd7a6' | json }};
+
+  if (typeof baseCollectionsPath === 'string') {
+    if (!baseCollectionsPath.endsWith('/')) baseCollectionsPath = baseCollectionsPath + '/';
+  } else { baseCollectionsPath = '/collections/'; }
+
+  // Build stateMap from blocks; include optional short/full fields with non-blank defaults
+  var stateMap = {
+    {% for block in section.blocks %}
+      {{ block.settings.state_id | json }}: {
+        label: {{ block.settings.state_label | json }},
+        short: {{ block.settings.state_short | default: '-' | json }},
+        full: {{ block.settings.state_full | default: '-' | json }},
+        collection_handle: {{ block.settings.collection.handle | default: '' | json }}
+      }{% if forloop.last == false %},{% endif %}
+    {% endfor %}
+  };
+
+  // Build URLs
+  Object.keys(stateMap).forEach(function(k){
+    var handle = stateMap[k].collection_handle;
+    if(handle && handle.length) stateMap[k].url = window.location.origin + baseCollectionsPath + handle;
+    else stateMap[k].url = '';
+  });
+
+  window.__stateMapForEnhance = stateMap;
+
+  var wrapper = document.getElementById('state-map-svg-wrapper');
+  var tooltip = document.getElementById('state-tooltip');
+  if(!wrapper) return;
+  var isTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+
+  function createLabelEl(shortText, left, top, color, small) {
+    var lbl = document.createElement('button');
+    lbl.type = 'button';
+    lbl.className = 'state-name-label' + (small ? ' small' : '');
+    lbl.innerText = shortText;
+    lbl.setAttribute('aria-label', shortText);
+    lbl.style.left = left + 'px';
+    lbl.style.top = top + 'px';
+    if(color) { lbl.style.color = color; lbl.style.borderColor = color + '33'; }
+    wrapper.appendChild(lbl);
+    return lbl;
+  }
+
+  function applyHoverFillToShape(shapeOrGroup, hoverColor) {
+    if(!shapeOrGroup) return;
+    var shapes = [];
+    var tag = shapeOrGroup.tagName.toLowerCase();
+    if(tag === 'g' || tag === 'svg') shapes = Array.from(shapeOrGroup.querySelectorAll('path, polygon, rect, circle'));
+    if(shapes.length === 0) shapes = [shapeOrGroup];
+    shapes.forEach(function(s){
+      try {
+        if(s.__originalFill === undefined) {
+          var inline = s.getAttribute && s.getAttribute('fill');
+          var comp = '';
+          try { comp = window.getComputedStyle(s).fill; } catch(e){ comp = ''; }
+          s.__originalFill = inline && inline !== 'none' ? inline : (comp && comp !== 'none' ? comp : '');
+        }
+        if(hoverColor) s.setAttribute('fill', hoverColor);
+      } catch(e){}
+    });
+  }
+
+  function restoreOriginalFill(shapeOrGroup) {
+    if(!shapeOrGroup) return;
+    var shapes = [];
+    var tag = shapeOrGroup.tagName.toLowerCase();
+    if(tag === 'g' || tag === 'svg') shapes = Array.from(shapeOrGroup.querySelectorAll('path, polygon, rect, circle'));
+    if(shapes.length === 0) shapes = [shapeOrGroup];
+    shapes.forEach(function(s){
+      try {
+        if(s.__originalFill !== undefined && s.__originalFill !== null && s.__originalFill !== '') s.setAttribute('fill', s.__originalFill);
+        else s.removeAttribute('fill');
+      } catch(e){}
+    });
+  }
+
+  // Fetch & inject SVG
+  fetch(svgUrl, { credentials: 'omit' })
+    .then(function(resp){
+      if(!resp.ok) throw new Error('Could not load SVG: ' + resp.status);
+      return resp.text();
+    })
+    .then(function(svgText){
+      wrapper.innerHTML = svgText;
+      var svg = wrapper.querySelector('svg');
+      if(!svg) { console.warn('No <svg> found after injection'); return; }
+      svg.setAttribute('id', 'india-map');
+
+      function findElementForState(stateId, label){
+        var el = svg.querySelector('#' + CSS.escape(stateId));
+        if(el) return {el: el, method: 'id'};
+        el = svg.querySelector('[data-name="' + stateId + '"], [data-id="' + stateId + '"]');
+        if(el) return {el: el, method: 'data-attr'};
+        el = Array.from(svg.querySelectorAll('[inkscape\\:label], [sodipodi\\:label]')).find(function(n){
+          var v = n.getAttribute('inkscape:label') || n.getAttribute('sodipodi:label');
+          return v === stateId || (label && v === label);
+        });
+        if(el) return {el: el, method: 'inkscape-label'};
+        el = Array.from(svg.querySelectorAll('title')).map(function(t){ return t.parentElement; })
+          .find(function(parent){
+            if(!parent) return false;
+            var txt = (parent.querySelector('title') && parent.querySelector('title').textContent || '').trim();
+            return txt === label || txt === stateId;
+          });
+        if(el) return {el: el, method: 'title-child'};
+        el = svg.querySelector('[aria-label="' + label + '"], [aria-label="' + stateId + '"]');
+        if(el) return {el: el, method: 'aria-label'};
+        el = Array.from(svg.querySelectorAll('[class]')).find(function(n){
+          var cls = n.getAttribute('class') || '';
+          return cls.split(/\s+/).indexOf(stateId) !== -1 || (label && cls.split(/\s+/).indexOf(label.replace(/\s+/g,'-').toLowerCase()) !== -1);
+        });
+        if(el) return {el: el, method: 'class-match'};
+        return {el: null, method: null};
+      }
+
+      // pick a fill color reference from first shape
+      var fillColor = '#2f7f4f';
+      try {
+        var firstShape = svg.querySelector('path, polygon, rect, circle, g');
+        if(firstShape) {
+          var comp = window.getComputedStyle(firstShape);
+          if(comp && comp.fill && comp.fill !== 'none') fillColor = comp.fill;
+          var inline = firstShape.getAttribute && firstShape.getAttribute('fill');
+          if(inline && inline !== 'none') fillColor = inline;
+        }
+      } catch(e){}
+
+      Object.keys(stateMap).forEach(function(stateId){
+        var cfg = stateMap[stateId];
+        var shortVal = (cfg.short && cfg.short.toString().trim().length && cfg.short.toString().trim() !== '-') ? cfg.short : (cfg.label ? cfg.label.toString().trim().slice(0,2).toUpperCase() : stateId.toUpperCase().slice(0,2));
+        var fullVal  = (cfg.full && cfg.full.toString().trim().length && cfg.full.toString().trim() !== '-') ? cfg.full : (cfg.label ? cfg.label : stateId);
+
+        var match = findElementForState(stateId, cfg.label);
+        if(!match.el) {
+          console.warn('No element found for stateId:', stateId, 'label:', cfg.label);
+          return;
+        }
+        var target = match.el;
+
+        if(target.tagName.toLowerCase() === 'g' || target.tagName.toLowerCase() === 'svg'){
+          target.classList.add('state-path');
+          var children = target.querySelectorAll('path, polygon, rect, circle');
+          children.forEach(function(c){ c.classList.add('state-path'); });
+        } else {
+          target.classList.add('state-path');
+        }
+
+        target.classList.add('debug-highlight');
+        setTimeout(function(){ target.classList.remove('debug-highlight'); }, 900);
+
+        if(cfg.url && cfg.url.length) target.classList.add('has-collection');
+
+        target.setAttribute('role', 'link');
+        target.setAttribute('tabindex', '0');
+        target.setAttribute('aria-label', fullVal);
+
+        target.addEventListener('mouseenter', function(e){
+          if(isTouch) return;
+          applyHoverFillToShape(target, hoverFill);
+          tooltip.style.display = 'block';
+          tooltip.innerText = fullVal;
+        });
+        target.addEventListener('mousemove', function(e){
+          var x = e.clientX + 12, y = e.clientY + 12, maxX = window.innerWidth - 220;
+          if(x > maxX) x = e.clientX - 220;
+          tooltip.style.left = x + 'px'; tooltip.style.top = y + 'px';
+        });
+        target.addEventListener('mouseleave', function(){
+          restoreOriginalFill(target);
+          tooltip.style.display = 'none';
+        });
+        target.addEventListener('focus', function(){ applyHoverFillToShape(target, hoverFill); tooltip.style.display = 'block'; tooltip.innerText = fullVal; });
+        target.addEventListener('blur', function(){ restoreOriginalFill(target); tooltip.style.display = 'none'; });
+
+        target.addEventListener('click', function(e){
+          var url = cfg.url;
+          if(url && url.length) window.location.href = url;
+          else alert((fullVal) + ' — collection not configured.');
+        });
+
+        target.addEventListener('keydown', function(ev){
+          if(ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); target.click(); }
+        });
+
+        try {
+          var bbox = target.getBBox ? target.getBBox() : null;
+          if(bbox) {
+            var matrix = svg.getScreenCTM();
+            var cx = bbox.x + bbox.width/2, cy = bbox.y + bbox.height/2;
+            var pt = svg.createSVGPoint(); pt.x = cx; pt.y = cy;
+            var screenPt = pt.matrixTransform(matrix);
+            var wrapperRect = wrapper.getBoundingClientRect();
+            var left = screenPt.x - wrapperRect.left;
+            var top  = screenPt.y - wrapperRect.top;
+            var labelEl = createLabelEl(shortVal, left, top, fillColor, bbox.width < 60);
+            labelEl.style.transform = 'translate(-50%, -60%)';
+            if(window.innerWidth < 720) labelEl.style.opacity = '0.9';
+
+            labelEl.addEventListener('mouseenter', function(){
+              tooltip.style.display = 'block'; tooltip.innerText = fullVal;
+              applyHoverFillToShape(target, hoverFill);
+            });
+            labelEl.addEventListener('mousemove', function(e){
+              var x = e.clientX + 12, y = e.clientY + 12, maxX = window.innerWidth - 220;
+              if(x > maxX) x = e.clientX - 220;
+              tooltip.style.left = x + 'px'; tooltip.style.top = y + 'px';
+            });
+            labelEl.addEventListener('mouseleave', function(){
+              tooltip.style.display = 'none';
+              restoreOriginalFill(target);
+            });
+            labelEl.addEventListener('focus', function(){
+              tooltip.style.display = 'block'; tooltip.innerText = fullVal; applyHoverFillToShape(target, hoverFill);
+            });
+            labelEl.addEventListener('blur', function(){ tooltip.style.display='none'; restoreOriginalFill(target); });
+            labelEl.addEventListener('click', function(){
+              if(stateMap[stateId] && stateMap[stateId].url) window.location.href = stateMap[stateId].url;
+            });
+            labelEl.addEventListener('keydown', function(ev){
+              if(ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); labelEl.click(); }
+            });
+            labelEl.setAttribute('aria-label', fullVal);
+            labelEl.setAttribute('tabindex', '0');
+          }
+        } catch(e){}
+      });
+
+      var shapes = svg.querySelectorAll('.state-path');
+      shapes.forEach(function(s, i){ setTimeout(function(){ s.classList.add('visible'); }, i * 18); });
+
+      svg.addEventListener('click', function(e){
+        var pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY;
+        var svgP = pt.matrixTransform(svg.getScreenCTM().inverse());
+        var circ = document.createElementNS('http://www.w3.org/2000/svg','circle');
+        circ.setAttribute('cx', svgP.x); circ.setAttribute('cy', svgP.y); circ.setAttribute('r', 2); circ.setAttribute('class','state-ripple');
+        svg.appendChild(circ);
+        setTimeout(function(){ circ && circ.parentNode && circ.parentNode.removeChild(circ); }, 700);
+      }, false);
+
+      var allIds = Array.from(svg.querySelectorAll('[id]')).map(function(n){ return n.id; });
+      console.info('SVG element ids (first 60):', allIds.slice(0,60));
+    })
+    .catch(function(err){
+      console.error('Error loading/injecting SVG:', err);
+      wrapper.innerHTML = '<div style="padding:18px;background:#fff;border:1px solid #eee;border-radius:6px;text-align:center;color:#666;">Could not load map. Check the SVG URL in the section settings.</div>';
+    });
+
+  // hide tooltip on scroll
+  window.addEventListener('scroll', function(){ if(tooltip) tooltip.style.display='none'; });
+
+})();
+</script>
+
+{% schema %}
+{
+  "name": "State Map (Shop by State)",
+  "settings": [
+    {
+      "type": "text",
+      "id": "intro_text",
+      "label": "Intro text (optional)",
+      "default": "Click a state to view sarees from that state"
+    },
+    {
+      "type": "text",
+      "id": "svg_url",
+      "label": "SVG file URL (paste your uploaded SVG link)",
+      "default": "https://cdn.shopify.com/s/files/1/0732/4729/3611/files/in.svg?v=1764927617"
+    },
+    {
+      "type": "color",
+      "id": "hover_color",
+      "label": "Hover color",
+      "default": "#ffd7a6"
+    }
+  ],
+  "blocks": [
+    {
+      "type": "state",
+      "name": "State mapping",
+      "settings": [
+        {
+          "type": "text",
+          "id": "state_id",
+          "label": "State ID (must match SVG element id)",
+          "default": "INRJ"
+        },
+        {
+          "type": "text",
+          "id": "state_label",
+          "label": "Visible label for tooltip / Full name",
+          "default": "Rajasthan"
+        },
+        {
+          "type": "text",
+          "id": "state_short",
+          "label": "Short label (e.g. RJ, MH) - optional",
+          "default": "-"
+        },
+        {
+          "type": "text",
+          "id": "state_full",
+          "label": "Full state name (tooltip) - optional",
+          "default": "-"
+        },
+        {
+          "type": "collection",
+          "id": "collection",
+          "label": "Select collection for this state"
+        }
+      ]
+    }
+  ],
+  "max_blocks": 40,
+  "presets": [
+    {
+      "name": "Shop by State Map",
+      "category": "Collections"
+    }
+  ]
+}
+{% endschema %}
